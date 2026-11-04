@@ -1,0 +1,44 @@
+# ---- Secrets: API keys and tokens (OPENROUTER_API_KEY, FIREWORKS_API_KEY, HF_TOKEN, ...) ----
+.env
+.env.*
+!.env.example
+
+# ---- Virtual environments ----
+.venv/
+venv/
+
+# ---- Python and tool caches ----
+__pycache__/
+*.pyc
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- macOS ----
+.DS_Store
+
+# ---- Research data: human-subject transcripts and their copies ----
+# Patterns match by folder name anywhere in the tree, so renamed folders stay ignored.
+**/original/
+**/human_redacted/
+**/redacted/
+**/llm/
+**/human/
+**/new/
+**/transcripts/
+**/analysis/
+**/normalized_utf8/
+**/data/
+
+# ---- Model outputs and results (any folder whose name contains "results") ----
+**/*results*/
+
+# ---- Generated tables, datasets and logs ----
+*.jsonl
+*.xlsx
+processing_statistics.csv
+evaluation_results*.csv
+eval_*.csv
+harness_*.csv
+**/run.log
+**/*verification_output*.txt
+**/generate_sample_overview.txt

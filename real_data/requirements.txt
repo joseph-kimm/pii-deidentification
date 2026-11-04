@@ -1,0 +1,10 @@
+# Requires Python 3.10+ (the scripts use "str | None" type hints).
+# Check with:  python --version   (or  py --version  on Windows)
+#
+# Nothing to install. build_catalog.py, sample_chunks.py, run_generation.py,
+# generate_sample.py, prompts.py and lmstudio_client.py use only the Python
+# standard library, and talk to LM Studio over its local HTTP server.
+#
+# Optional, only for  build_catalog.py --tokenizer <Hugging Face model name>
+# (the default --tokenizer words needs nothing):
+# transformers
