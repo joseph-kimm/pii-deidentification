@@ -9,7 +9,7 @@ Where the transcripts go (recommended, inside this folder):
     data\\human\\*.txt      human-redacted versions, SAME file names
     data\\llm\\*.txt        LLM-redacted versions,   SAME file names
   Every redaction must be the literal token [REDACTED]. Files must be
-  UTF-8 text with "Speaker 1:" style labels (Notepad's "UTF-8" and
+  UTF-8 text with "Coach:", "Teacher:" or "Speaker 1:" labels (Notepad's "UTF-8" and
   "UTF-8 with BOM" both work). A file missing from human\\ or llm\\ is
   skipped with a [SKIP] message.
 
@@ -32,8 +32,10 @@ Output: catalog.csv (positions only, no text). Next: sample_chunks.py.
 Needs Python 3.10+, standard library only (unless using an HF tokenizer).
 =============================================================================
 
-Each transcript is split into speaker turns (text before the first 'Speaker X:'
-label is not a turn). A turn longer than --max-tokens is split at sentence
+Speaker labels are 'Coach:', 'Teacher:' or 'Speaker X:' at the start of a line
+(add more with --labels). Inline 'index start --> end' timestamps are removed
+from all three versions before counting, so they never count as words.
+Each transcript is split into speaker turns (text before the first label is not a turn). A turn longer than --max-tokens is split at sentence
 breaks into balanced pieces; every turn or piece is one chunk (one row). Short
 turns that neither the human nor the LLM redacted anything in are left out.
 
@@ -57,8 +59,9 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+from transcript_utils import label_regex, strip_timestamps
+
 REDACTED = "[REDACTED]"
-SPEAKER_RE = re.compile(r"(?<![A-Za-z])Speaker\s*[A-Za-z0-9]{0,3}\s*:")
 ABBREVIATIONS = {"dr.", "mr.", "mrs.", "ms.", "prof.", "st.", "jr.", "sr.", "mt.", "ft.", "rev.", "gov.", "sen."}
 _CLOSERS = "\"')]’”"
 
@@ -80,14 +83,14 @@ def tokenize(text):
     return [m.group() for m in matches], [m.start() for m in matches]
 
 
-def find_turns(text, word_starts):
+def find_turns(text, word_starts, label_re):
     """
     Return (turns, label_words): turns as [(start, end)] word ranges, each starting
-    at a 'Speaker X:' label and running to the next one, and the set of word
+    at a speaker label and running to the next one, and the set of word
     indices that belong to a label. Text before the first label is not a turn.
     """
     starts, label_words = set(), set()
-    for m in SPEAKER_RE.finditer(text):
+    for m in label_re.finditer(text):
         first = max(bisect.bisect_right(word_starts, m.start()) - 1, 0)
         last = bisect.bisect_left(word_starts, m.end()) - 1
         starts.add(first)
@@ -296,12 +299,12 @@ def chunk_row(file, turn_idx, piece_idx, s, e, words, human, llm, size):
     }
 
 
-def catalog_file(file, orig_text, human_text, llm_text, count, min_tokens, max_tokens):
-    """Return (rows, n_excluded_turns) for one transcript."""
+def catalog_file(file, orig_text, human_text, llm_text, count, min_tokens, max_tokens, label_re):
+    """Return (rows, n_excluded_turns) for one transcript. Texts must already be timestamp-free."""
     words, starts = tokenize(orig_text)
     human = align(orig_text, human_text)
     llm = align(orig_text, llm_text)
-    turns, label_words = find_turns(orig_text, starts)
+    turns, label_words = find_turns(orig_text, starts, label_re)
 
     def size(s, e):
         return count(" ".join(words[s:e]))
@@ -332,6 +335,7 @@ def make_counter(spec):
 
 def build(args):
     count = make_counter(args.tokenizer)
+    label_re = label_regex(args.labels)
     print(f"Settings: min={args.min_tokens} max={args.max_tokens} tokenizer={args.tokenizer}")
     rows, n_files = [], 0
     for orig_path in sorted(Path(args.original).glob("*.txt")):
@@ -339,16 +343,17 @@ def build(args):
         if not human_path.exists() or not llm_path.exists():
             print(f"[SKIP] {orig_path.name}: missing human or LLM version", file=sys.stderr)
             continue
-        orig_text = orig_path.read_text(encoding="utf-8-sig")
+        texts = [strip_timestamps(p.read_text(encoding="utf-8-sig"))
+                 for p in (orig_path, human_path, llm_path)]
         file_rows, excluded = catalog_file(
-            orig_path.name, orig_text, human_path.read_text(encoding="utf-8-sig"),
-            llm_path.read_text(encoding="utf-8-sig"), count, args.min_tokens, args.max_tokens)
-        if not SPEAKER_RE.search(orig_text):
-            print(f"[WARN] {orig_path.name}: no 'Speaker X:' labels found", file=sys.stderr)
+            orig_path.name, *texts, count, args.min_tokens, args.max_tokens, label_re)
+        if not label_re.search(texts[0]):
+            print(f"[WARN] {orig_path.name}: no speaker labels found (see --labels)", file=sys.stderr)
         rows.extend(file_rows)
         n_files += 1
         print(f"[OK] {orig_path.name}: {len(file_rows)} chunks, {excluded} short turns excluded")
 
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         writer.writeheader()
@@ -365,6 +370,8 @@ def parse_args(argv=None):
     p.add_argument("--min-tokens", type=int, required=True, help="shorter turns with no redactions are excluded")
     p.add_argument("--max-tokens", type=int, required=True, help="longer turns are split into pieces")
     p.add_argument("--tokenizer", required=True, help="Hugging Face model name, or 'words' to count words")
+    p.add_argument("--labels", type=lambda s: [x for x in s.split(",") if x.strip()], default=[],
+                   help="extra speaker role names, comma separated (Coach, Teacher and Speaker X are always used)")
     return p.parse_args(argv)
 
 

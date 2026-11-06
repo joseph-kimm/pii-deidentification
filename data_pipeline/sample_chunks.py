@@ -11,12 +11,13 @@ the files must not be edited in between).
 
 Run (Command Prompt / PowerShell opened in this folder; "py" if "python"
 is not found; put a path in "quotes" if it contains spaces):
-    python sample_chunks.py --catalog ..\\results\\real_data\\catalog.csv --original ..\\data\\synthetic\\original --human ..\\data\\synthetic\\human_redacted --llm ..\\data\\synthetic\\llm_redacted --out-dir ..\\results\\real_data\\samples\\sample_001 --n 500 --seed 42
+    python sample_chunks.py --catalog ..\\results\\synthetic\\catalog.csv --original ..\\data\\synthetic\\original --human ..\\data\\synthetic\\human_redacted --llm ..\\data\\synthetic\\llm_redacted --out-dir ..\\results\\synthetic\\samples\\sample_001 --n 500 --seed 42
+  (2_sample_chunks.bat builds these paths from settings.bat; the example uses DATA_SET=synthetic.)
 
   --out-dir must be a NEW folder; an existing one is never overwritten.
   --n is the number of chunks; it fails if the catalog has fewer.
 
-Output: ..\\results\\real_data\\samples\\sample_001\\chunks.jsonl (+ config.json). Each chunk has a
+Output: ..\\results\\synthetic\\samples\\sample_001\\chunks.jsonl (+ config.json). Each chunk has a
 "review" field; to fix a bad human redaction by hand, put the corrected
 text in review.human_text_corrected, or set review.status to "rejected"
 to have run_generation.py skip that chunk.
@@ -30,7 +31,7 @@ Writes into --out-dir (which must not exist yet, so a sample is never changed):
 
 Usage:
     python sample_chunks.py --catalog catalog.csv --original original/ --human human/ --llm llm/ \
-        --out-dir ../results/real_data/samples/sample_001 --n 500 --seed 42
+        --out-dir ../results/synthetic/samples/sample_001 --n 500 --seed 42
     # --files train_files.txt     only sample from the files listed (one name per line)
     # --exclude samples/sample_000/chunks.jsonl ...   skip chunks used in earlier samples
 """
@@ -155,7 +156,7 @@ def parse_args(argv=None):
     p.add_argument("--original", required=True, help="folder of original transcripts")
     p.add_argument("--human", required=True, help="folder of human-redacted transcripts")
     p.add_argument("--llm", required=True, help="folder of LLM-redacted transcripts")
-    p.add_argument("--out-dir", required=True, help="new folder for this sample, e.g. ../results/real_data/samples/sample_001")
+    p.add_argument("--out-dir", required=True, help="new folder for this sample, e.g. ../results/synthetic/samples/sample_001")
     p.add_argument("--n", type=int, required=True, help="number of chunks to sample")
     p.add_argument("--seed", type=int, required=True, help="random seed, so the sample can be reproduced")
     p.add_argument("--files", default=None, help="optional text file of allowed file names, one per line")

@@ -17,15 +17,15 @@ is not found):
   3. python run_generation.py --check     (tests LM Studio + finds the sample; no generation)
      python run_generation.py             (the real run)
 
-Recommended folder layout (everything inside this folder):
-  real_data\\
-    build_catalog.py  sample_chunks.py  run_generation.py
-    generate_sample.py  prompts.py  lmstudio_client.py
-    data\\original\\*.txt   real transcripts
-    data\\human\\*.txt      human-redacted versions (same file names)
-    data\\llm\\*.txt        LLM-redacted versions   (same file names)
-    catalog.csv            written by step 1
-    samples\\sample_001\\    written by step 2, read and added to by step 3
+Normally run through 4_generate.bat, which reads SAMPLE_DIR from settings.bat.
+Paths are set in data_pipeline\\settings.bat (DATA_SET, folder names, RESULTS_DIR):
+  <project root>\\
+    data_pipeline\\                      scripts, .bat files, settings.bat
+    data\\<DATA_SET>\\original\\          real or synthetic transcripts
+    data\\<DATA_SET>\\human\\             human-redacted versions (same file names)
+    data\\<DATA_SET>\\llm\\               LLM-redacted versions   (same file names)
+    results\\<DATA_SET>\\catalog.csv     written by step 1
+    results\\<DATA_SET>\\samples\\sample_001\\   written by step 2, read and added to by step 3
 
 What this file needs:
   - Python 3.10+ (standard library only; nothing to pip install).
@@ -77,7 +77,7 @@ from lmstudio_client import LMStudioClient, LMStudioError  # noqa: E402
 # --- Settings: edit these ----------------------------------------------------
 
 # Folder made by sample_chunks.py (--out-dir). Must contain chunks.jsonl.
-SAMPLE_DIR = SCRIPT_DIR.parent / "results" / "real_data" / "samples" / "sample_001"
+SAMPLE_DIR = SCRIPT_DIR.parent / "results" / "synthetic" / "samples" / "sample_001"  # 4_generate.bat overrides this
 
 # LM Studio server address (Developer tab), with /v1 at the end.
 LLM_BASE_URL = "http://localhost:1234/v1"

@@ -9,7 +9,7 @@ echo   original: %ORIGINAL_DIR%
 echo   human:    %HUMAN_DIR%
 echo   llm:      %LLM_DIR%
 echo.
-%PY% build_catalog.py --original "%ORIGINAL_DIR%" --human "%HUMAN_DIR%" --llm "%LLM_DIR%" --out "%CATALOG%" --min-tokens %MIN_TOKENS% --max-tokens %MAX_TOKENS% --tokenizer words
+%PY% build_catalog.py --original "%ORIGINAL_DIR%" --human "%HUMAN_DIR%" --llm "%LLM_DIR%" --out "%CATALOG%" --min-tokens %MIN_TOKENS% --max-tokens %MAX_TOKENS% --tokenizer words --labels "%EXTRA_LABELS%"
 if errorlevel 1 (
   echo.
   echo [FAILED] See the message above.
