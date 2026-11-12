@@ -51,7 +51,10 @@ pip install openai requests pandas huggingface_hub python-dotenv matplotlib open
 OPENROUTER_API_KEY=...
 FIREWORKS_API_KEY=...
 HF_TOKEN=...
+FIREWORKS_ACCOUNT_ID=...   # Fireworks account that owns the fine-tuned Muse checkpoint
 ```
+
+`deidentify/.env.example` lists the same variables.
 
 ## Usage
 

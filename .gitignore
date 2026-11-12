@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# ---- Fine-tuning run logs: session/run IDs and checkpoint paths of a specific account ----
+finetune/runs/
+
 # ---- Virtual environments ----
 .venv/
 venv/
