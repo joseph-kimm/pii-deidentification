@@ -44,16 +44,25 @@ hf_client = InferenceClient(model=hf_model, token=hf_token)
 openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
 model_name = os.getenv('MODEL_NAME', 'meta-llama/llama-3.1-8b-instruct')
 
-# OpenAI-compatible endpoint used by openrouter_api_call: 'openrouter' or 'fireworks'
+# OpenAI-compatible endpoint used by openrouter_api_call: 'openrouter' or 'fireworks'.
+# 'fireworks-sampler' is not OpenAI-compatible: it samples Muse Glimmer 30B (base model or a
+# training checkpoint) through the serverless training SDK; see muse_sampler.py.
 PROVIDERS = {
     'openrouter': ("https://openrouter.ai/api/v1", openrouter_api_key),
     'fireworks': ("https://api.fireworks.ai/inference/v1", os.getenv('FIREWORKS_API_KEY')),
+    'fireworks-sampler': (None, os.getenv('FIREWORKS_API_KEY')),
 }
 provider = os.getenv('PROVIDER', 'openrouter')
 if provider not in PROVIDERS:
     print(f"Unknown PROVIDER '{provider}', expected one of {list(PROVIDERS)}")
     raise SystemExit(1)
 provider_base_url, provider_api_key = PROVIDERS[provider]
+
+# Optional reasoning_effort for reasoning models (e.g. "low"); unset = not sent.
+reasoning_effort = os.getenv('REASONING_EFFORT', '').strip() or None
+# Transient errors (incl. 503 while a scale-to-zero deployment wakes) are retried up to this long.
+API_MAX_WAIT_S = float(os.getenv('API_MAX_WAIT_S', '900'))
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # -------------------------
 # Small helpers (logging/redaction)
@@ -163,18 +172,50 @@ def huggingface_call(post_text, prompt):
         print(f"[HUGGINGFACE ERROR] text='{_preview(post_text, 120)}' | {str(e)}")
         return "API_ERROR"
 
+def _create_with_retry(client, **kwargs):
+    """
+    chat.completions.create, retrying transient errors with exponential backoff.
+
+    A scale-to-zero deployment answers 503 for several minutes while a replica boots.
+    Without this, each 503 became API_ERROR, the harness fell back to line- and
+    word-level calls, and any word that still failed was kept unredacted.
+    Non-retryable errors (e.g. 400, 401, 404) are raised immediately.
+    """
+    deadline = time.monotonic() + API_MAX_WAIT_S
+    attempt = 0
+    while True:
+        try:
+            return client.chat.completions.create(**kwargs)
+        except openai.APIStatusError as e:
+            if e.status_code not in RETRY_STATUSES:
+                raise
+            reason = f"HTTP {e.status_code}"
+        except (openai.APIConnectionError, openai.APITimeoutError) as e:
+            reason = type(e).__name__
+        delay = min(2.0 * (2 ** attempt), 30.0)
+        if time.monotonic() + delay > deadline:
+            raise RuntimeError(f"gave up after {attempt + 1} attempts ({reason}); waited ~{API_MAX_WAIT_S:.0f}s")
+        print(f"[RETRY {attempt + 1}] {reason}; waiting {delay:.0f}s (deployment may be scaling up from zero)")
+        time.sleep(delay)
+        attempt += 1
+
 def openrouter_api_call(post_text, prompt):
     try:
         client = openai.OpenAI(
             api_key=provider_api_key,
             base_url=provider_base_url,
+            max_retries=0,  # retries are handled by _create_with_retry
+            timeout=300,
         )
-        response = client.chat.completions.create(
+        response = _create_with_retry(
+            client,
             model=model_name,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "Text to edit: " + post_text}
             ],
+            # Only sent when REASONING_EFFORT is set, so other models' requests are unchanged.
+            extra_body={"reasoning_effort": reasoning_effort} if reasoning_effort else None,
         )
         content = response.choices[0].message.content
         if content is None:
@@ -186,8 +227,26 @@ def openrouter_api_call(post_text, prompt):
         print(f"[OPENROUTER ERROR] text='{_preview(post_text, 120)}' | {str(e)}")
         return "API_ERROR"
 
+def sampler_api_call(post_text, prompt):
+    import muse_sampler  # needs the training SDK, so only imported for this provider
+    try:
+        content = muse_sampler.chat(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "Text to edit: " + post_text}
+            ],
+            model=model_name,
+            reasoning_strength=reasoning_effort or "high",  # renderer default when unset
+        )
+        return content.strip()
+    except Exception as e:
+        print(f"[SAMPLER ERROR] text='{_preview(post_text, 120)}' | {type(e).__name__}: {str(e)}")
+        return "API_ERROR"
+
 def api_call(post_text, prompt):
     try:
+        if provider == 'fireworks-sampler':
+            return sampler_api_call(post_text, prompt)
         return openrouter_api_call(post_text, prompt)  # default: OpenRouter
         # return huggingface_call(post_text, prompt)  # <- switch to HuggingFace
         # return openai_api_call(post_text, prompt)      # <- switch to OpenAI
@@ -244,6 +303,67 @@ def remove_empty_speaker_lines(text):
             continue
         non_empty_lines.append(line)
     return '\n'.join(non_empty_lines)
+
+# -------------------------
+# Speaker labels at the start of a line
+# -------------------------
+# "Speaker A:", "Speaker 1:", "Coach:" etc. are transcript format, not PII. They are
+# removed before redaction, so the model never sees them, and put back afterwards.
+SPEAKER_ROLE_WORDS = (
+    "Coach", "Teacher", "Mentor", "Coordinator", "Interviewer", "Interviewee",
+    "Participant", "Facilitator", "Moderator", "Host", "Guest", "Principal",
+    "Counselor", "Tutor", "Student", "Parent", "Staff", "Administrator", "Observer",
+    "Instructor", "Professor", "Nurse", "Therapist", "Client", "Patient", "Customer",
+    "Agent", "Caller", "Doctor", "Advisor", "Mediator", "Supervisor",
+)
+SPEAKER_QUALIFIERS = ("Head", "Assistant", "Lead", "Senior", "Junior", "Co", "Guest")
+_SPEAKER_ROLE_PATTERN = r"(?:(?:%s)\s+)?(?:%s)" % ("|".join(SPEAKER_QUALIFIERS), "|".join(SPEAKER_ROLE_WORDS))
+# A label at the very start of a line: "Speaker" + one letter/number, or a role + optional
+# one/two-character id ("Teacher 2"). Anything else ("Speaker Josh:", "Jordan:") is not a label.
+_LINE_LABEL_RE = re.compile(
+    r"^(?P<label>Speaker\s+[A-Za-z0-9]{1,2}|%s(?:\s+[A-Za-z0-9]{1,2})?):(?P<body>.*)$" % _SPEAKER_ROLE_PATTERN
+)
+
+def split_speaker_label(line):
+    """Return (label, body) for a line that starts with a speaker label, else (None, line)."""
+    m = _LINE_LABEL_RE.match(line)
+    if not m:
+        return None, line
+    return m.group("label") + ":", m.group("body").lstrip()
+
+def process_with_speaker_labels(text, prompt, api_call_func, stats):
+    """
+    1) Remove the speaker label at the start of each line.
+    2) Redact the remaining text with the existing chunk/line/word pipeline.
+    3) Put each label back at the start of its line.
+
+    The redacted words are split back into lines using each line's original word count.
+    The redaction keeps the word count (enforce_word_count_match), so every line gets
+    its own words back.
+    """
+    lines = text.split("\n")
+    labels, bodies = [], []
+    for line in lines:
+        label, body = split_speaker_label(line.strip())
+        labels.append(label)
+        bodies.append(body)
+
+    body_word_counts = [len(body.split()) for body in bodies]
+    joined = " ".join(body for body in bodies if body.strip())
+    if not joined.strip():
+        return text
+
+    redacted_words = process_text_content(joined, prompt, api_call_func, stats).split()
+    expected = sum(body_word_counts)
+    if len(redacted_words) != expected:
+        raise ValueError(f"Word count changed during redaction: {expected} -> {len(redacted_words)}")
+
+    out_lines, pos = [], 0
+    for label, count in zip(labels, body_word_counts):
+        body = " ".join(redacted_words[pos:pos + count])
+        pos += count
+        out_lines.append((label + " " + body).rstrip() if label else body)
+    return "\n".join(out_lines)
 
 # -------------------------
 # Sentence chunking
@@ -628,145 +748,146 @@ def process_text_content(original_text, prompt, api_call_func, stats):
 # -------------------------
 # Main file processing
 # -------------------------
-try:
-    original_files = os.listdir(original_folder_path)
-except Exception as e:
-    print(f"Error reading from directory {original_folder_path}: {str(e)}")
-    raise SystemExit(1)
-
-processing_stats = []
-
-for original_file in original_files:
-    if not original_file.endswith(".txt"):
-        continue
-
-    print(f"\n========== Processing file {original_file} ==========")
-
-    file_stats = {
-        'filename': original_file,
-        'model_name': model_name,
-        'prompt_label': prompt_label,
-        'chunk_failures': 0,
-        'line_failures': 0,
-        'word_failures': 0,
-        'redacted_span_expansions': 0,
-        'redacted_extra_tokens': 0,
-        'processing_time_minutes': 0,
-        'start_time': time.time()
-    }
-
-    original_file_path = os.path.join(original_folder_path, original_file)
-    safe_model = re.sub(r'[^\w\-]', '_', model_name)
-    safe_prompt = re.sub(r'[^\w\-]', '_', prompt_label)
-    stem, ext = os.path.splitext(original_file)
-    new_filename = f"{stem}__{safe_prompt}__{safe_model}{ext}"
-    new_file_path = os.path.join(output_folder, new_filename)
-
+if __name__ == "__main__":
     try:
-        with open(original_file_path, 'r') as original_file_handle, open(new_file_path, 'w') as new_file_handle:
-            for _, row in prompt_df.iterrows():
-                prompt = row['prompt']
+        original_files = os.listdir(original_folder_path)
+    except Exception as e:
+        print(f"Error reading from directory {original_folder_path}: {str(e)}")
+        raise SystemExit(1)
 
-                original_file_handle.seek(0)
-                all_lines = original_file_handle.readlines()
+    processing_stats = []
 
-                if len(all_lines) > 1:
-                    has_header = not _is_speaker_line(all_lines[0])
+    for original_file in original_files:
+        if not original_file.endswith(".txt"):
+            continue
 
-                    if has_header:
-                        first_line = normalize_whitespace(all_lines[0].rstrip('\n'))
-                        remaining_content = ''.join(all_lines[1:]).strip()
-                    else:
-                        first_line = None
-                        remaining_content = ''.join(all_lines).strip()
-                        print(f"No header line detected (file starts with a speaker turn): {original_file}")
+        print(f"\n========== Processing file {original_file} ==========")
 
-                    remaining_content = normalize_speaker_format(remaining_content)
-                    remaining_content = remove_empty_speaker_lines(remaining_content)
+        file_stats = {
+            'filename': original_file,
+            'model_name': model_name,
+            'prompt_label': prompt_label,
+            'chunk_failures': 0,
+            'line_failures': 0,
+            'word_failures': 0,
+            'redacted_span_expansions': 0,
+            'redacted_extra_tokens': 0,
+            'processing_time_minutes': 0,
+            'start_time': time.time()
+        }
 
-                    if NORMALIZE_ORIGINALS_ON_DISK:
-                        normalized_original = (
-                            first_line + "\n\n" + remaining_content + "\n" if has_header
-                            else remaining_content + "\n"
-                        )
-                        with open(original_file_path, 'w') as orig_write:
-                            orig_write.write(normalized_original)
-                        print(f"Normalized original file: {original_file}")
+        original_file_path = os.path.join(original_folder_path, original_file)
+        safe_model = re.sub(r'[^\w\-]', '_', model_name)
+        safe_prompt = re.sub(r'[^\w\-]', '_', prompt_label)
+        stem, ext = os.path.splitext(original_file)
+        new_filename = f"{stem}__{safe_prompt}__{safe_model}{ext}"
+        new_file_path = os.path.join(output_folder, new_filename)
 
-                    if remaining_content:
-                        processed_content = process_text_content(remaining_content, prompt, api_call, file_stats)
-                        processed_content = normalize_speaker_format(processed_content)
-                        processed_content = remove_empty_speaker_lines(processed_content)
+        try:
+            with open(original_file_path, 'r') as original_file_handle, open(new_file_path, 'w') as new_file_handle:
+                for _, row in prompt_df.iterrows():
+                    prompt = row['prompt']
+
+                    original_file_handle.seek(0)
+                    all_lines = original_file_handle.readlines()
+
+                    if len(all_lines) > 1:
+                        has_header = not _is_speaker_line(all_lines[0])
+
                         if has_header:
-                            new_file_handle.write(first_line + "\n\n" + processed_content + "\n")
-                            print(f"Processed file (skipped header line): {original_file}")
+                            first_line = normalize_whitespace(all_lines[0].rstrip('\n'))
+                            remaining_content = ''.join(all_lines[1:]).strip()
                         else:
-                            new_file_handle.write(processed_content + "\n")
-                            print(f"Processed file (no header line): {original_file}")
-                    elif has_header:
-                        new_file_handle.write(first_line + "\n")
-                        print(f"File {original_file} has only a header line, copied as-is")
+                            first_line = None
+                            remaining_content = ''.join(all_lines).strip()
+                            print(f"No header line detected (file starts with a speaker turn): {original_file}")
 
-                elif len(all_lines) == 1:
-                    normalized_line = normalize_speaker_format(all_lines[0])
-                    normalized_line = remove_empty_speaker_lines(normalized_line)
-                    if NORMALIZE_ORIGINALS_ON_DISK:
-                        with open(original_file_path, 'w') as orig_write:
-                            orig_write.write(normalized_line + "\n")
-                        print(f"Normalized original file: {original_file}")
-                    new_file_handle.write(normalized_line + "\n")
-                    print(f"File {original_file} has only one line, copied as-is")
-                else:
-                    print(f"File {original_file} is empty, skipping...")
+                        remaining_content = normalize_speaker_format(remaining_content)
+                        remaining_content = remove_empty_speaker_lines(remaining_content)
+
+                        if NORMALIZE_ORIGINALS_ON_DISK:
+                            normalized_original = (
+                                first_line + "\n\n" + remaining_content + "\n" if has_header
+                                else remaining_content + "\n"
+                            )
+                            with open(original_file_path, 'w') as orig_write:
+                                orig_write.write(normalized_original)
+                            print(f"Normalized original file: {original_file}")
+
+                        if remaining_content:
+                            processed_content = process_with_speaker_labels(remaining_content, prompt, api_call, file_stats)
+                            processed_content = normalize_speaker_format(processed_content)
+                            processed_content = remove_empty_speaker_lines(processed_content)
+                            if has_header:
+                                new_file_handle.write(first_line + "\n\n" + processed_content + "\n")
+                                print(f"Processed file (skipped header line): {original_file}")
+                            else:
+                                new_file_handle.write(processed_content + "\n")
+                                print(f"Processed file (no header line): {original_file}")
+                        elif has_header:
+                            new_file_handle.write(first_line + "\n")
+                            print(f"File {original_file} has only a header line, copied as-is")
+
+                    elif len(all_lines) == 1:
+                        normalized_line = normalize_speaker_format(all_lines[0])
+                        normalized_line = remove_empty_speaker_lines(normalized_line)
+                        if NORMALIZE_ORIGINALS_ON_DISK:
+                            with open(original_file_path, 'w') as orig_write:
+                                orig_write.write(normalized_line + "\n")
+                            print(f"Normalized original file: {original_file}")
+                        new_file_handle.write(normalized_line + "\n")
+                        print(f"File {original_file} has only one line, copied as-is")
+                    else:
+                        print(f"File {original_file} is empty, skipping...")
+
+        except Exception as e:
+            print(f"Error processing file {original_file_path}: {str(e)}")
+
+        # timing + stats
+        end_time = time.time()
+        processing_time_seconds = end_time - file_stats['start_time']
+        file_stats['processing_time_minutes'] = round(processing_time_seconds / 60, 2)
+        del file_stats['start_time']
+
+        processing_stats.append(file_stats)
+
+        print(f"\n========== File {original_file} completed ==========")
+        print(f"Processing time: {file_stats['processing_time_minutes']} minutes")
+        print(f"Chunk failures: {file_stats['chunk_failures']}")
+        print(f"Line failures: {file_stats['line_failures']}")
+        print(f"Word failures: {file_stats['word_failures']}")
+        print(f"Redacted span expansions: {file_stats['redacted_span_expansions']} "
+              f"(+{file_stats['redacted_extra_tokens']} tokens)")
+
+    # -------------------------
+    # Write processing statistics
+    # -------------------------
+    try:
+        with open(stats_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['filename', 'model_name', 'prompt_label', 'chunk_failures', 'line_failures', 'word_failures',
+                          'redacted_span_expansions', 'redacted_extra_tokens', 'processing_time_minutes']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for stats in processing_stats:
+                writer.writerow(stats)
+
+        print(f"\nProcessing statistics saved to {stats_csv_path}")
+
+        total_files = len(processing_stats)
+        total_chunk_failures = sum(stats['chunk_failures'] for stats in processing_stats)
+        total_line_failures = sum(stats['line_failures'] for stats in processing_stats)
+        total_word_failures = sum(stats['word_failures'] for stats in processing_stats)
+        total_span_expansions = sum(stats['redacted_span_expansions'] for stats in processing_stats)
+        total_time = sum(stats['processing_time_minutes'] for stats in processing_stats)
+
+        print(f"\n=== PROCESSING SUMMARY ===")
+        print(f"Total files processed: {total_files}")
+        print(f"Total chunk failures: {total_chunk_failures}")
+        print(f"Total line failures: {total_line_failures}")
+        print(f"Total word failures: {total_word_failures}")
+        print(f"Total redacted span expansions: {total_span_expansions}")
+        print(f"Total processing time: {total_time:.2f} minutes")
+        print(f"Average processing time per file: {total_time/total_files:.2f} minutes" if total_files > 0 else "No files processed")
 
     except Exception as e:
-        print(f"Error processing file {original_file_path}: {str(e)}")
-
-    # timing + stats
-    end_time = time.time()
-    processing_time_seconds = end_time - file_stats['start_time']
-    file_stats['processing_time_minutes'] = round(processing_time_seconds / 60, 2)
-    del file_stats['start_time']
-
-    processing_stats.append(file_stats)
-
-    print(f"\n========== File {original_file} completed ==========")
-    print(f"Processing time: {file_stats['processing_time_minutes']} minutes")
-    print(f"Chunk failures: {file_stats['chunk_failures']}")
-    print(f"Line failures: {file_stats['line_failures']}")
-    print(f"Word failures: {file_stats['word_failures']}")
-    print(f"Redacted span expansions: {file_stats['redacted_span_expansions']} "
-          f"(+{file_stats['redacted_extra_tokens']} tokens)")
-
-# -------------------------
-# Write processing statistics
-# -------------------------
-try:
-    with open(stats_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['filename', 'model_name', 'prompt_label', 'chunk_failures', 'line_failures', 'word_failures',
-                      'redacted_span_expansions', 'redacted_extra_tokens', 'processing_time_minutes']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for stats in processing_stats:
-            writer.writerow(stats)
-
-    print(f"\nProcessing statistics saved to {stats_csv_path}")
-
-    total_files = len(processing_stats)
-    total_chunk_failures = sum(stats['chunk_failures'] for stats in processing_stats)
-    total_line_failures = sum(stats['line_failures'] for stats in processing_stats)
-    total_word_failures = sum(stats['word_failures'] for stats in processing_stats)
-    total_span_expansions = sum(stats['redacted_span_expansions'] for stats in processing_stats)
-    total_time = sum(stats['processing_time_minutes'] for stats in processing_stats)
-
-    print(f"\n=== PROCESSING SUMMARY ===")
-    print(f"Total files processed: {total_files}")
-    print(f"Total chunk failures: {total_chunk_failures}")
-    print(f"Total line failures: {total_line_failures}")
-    print(f"Total word failures: {total_word_failures}")
-    print(f"Total redacted span expansions: {total_span_expansions}")
-    print(f"Total processing time: {total_time:.2f} minutes")
-    print(f"Average processing time per file: {total_time/total_files:.2f} minutes" if total_files > 0 else "No files processed")
-
-except Exception as e:
-    print(f"Error writing statistics CSV: {str(e)}")
+        print(f"Error writing statistics CSV: {str(e)}")

@@ -50,6 +50,17 @@ HUMAN_DIR = PROJECT_ROOT / "data" / "synthetic" / "human_redacted"
 RESULTS_DIR = PROJECT_ROOT / "results" / "deidentify" / "compare_models"
 HARNESS = SCRIPT_DIR / "de_identify_steplab.py"
 
+# Base and fine-tuned Muse Glimmer 30B are sampled through the serverless training SDK
+# (provider "fireworks-sampler", deidentify/muse_sampler.py): billed per token, no deployment.
+# The base is the serverless base model; the fine-tuned model is the sampler checkpoint that was
+# promoted to deid-glimmer-30b-sft-synthetic (e2-s09, lowest val loss; see finetune/runs/).
+# The Fireworks account ID comes from FIREWORKS_ACCOUNT_ID in deidentify/.env (kept out of git).
+MUSE_ACCOUNT = os.getenv("FIREWORKS_ACCOUNT_ID", "").strip()
+MUSE_BASE = "accounts/fireworks/models/muse-glimmer-30b"
+MUSE_SFT_CHECKPOINT = "run-10e3b111a1a542c7b1134ca56ca25d21/e2-s09-86bfa793"
+MUSE_SFT = f"{MUSE_ACCOUNT or 'FIREWORKS_ACCOUNT_ID-unset'}/{MUSE_SFT_CHECKPOINT}"
+SAMPLER_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"  # has the training SDK
+
 # (provider, model) -- provider must be a key of PROVIDERS in de_identify_steplab.py
 MODELS = [
     ("fireworks", "accounts/fireworks/models/deepseek-v4p1-flash-1017"),
@@ -59,7 +70,24 @@ MODELS = [
     ("fireworks", "accounts/fireworks/models/glm-5p3-flash"),
     ("openrouter", "meta-llama/llama-3.1-8b-instruct"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct"),
+    ("fireworks-sampler", MUSE_BASE),
+    ("fireworks-sampler", MUSE_SFT),
 ]
+
+# Plot/summary labels for models whose last path segment isn't a readable name.
+MODEL_LABELS = {
+    MUSE_BASE: "muse-glimmer-30b (base)",
+    MUSE_SFT: "muse-glimmer-30b (fine-tuned)",
+}
+
+# Extra environment for specific models, passed to the harness (and used by --smoke).
+# Models not listed here get no extra settings, so their requests are unchanged.
+# Both Muse models get the reasoning strength the LoRA was trained with (finetune/serverless_sft.py);
+# the sampler renders it into the system prompt exactly as in training.
+MODEL_ENV = {
+    MUSE_BASE: {"REASONING_EFFORT": "low"},
+    MUSE_SFT: {"REASONING_EFFORT": "low"},
+}
 
 # Only used by --smoke; the harness itself picks its endpoint from PROVIDER.
 SMOKE_ENDPOINTS = {
@@ -78,7 +106,7 @@ def safe_name(s: str) -> str:
 
 
 def short_name(model: str) -> str:
-    return model.split("/")[-1]
+    return MODEL_LABELS.get(model) or model.split("/")[-1]
 
 
 def model_dir(model: str) -> Path:
@@ -95,11 +123,19 @@ def eval_files():
 def smoke_test() -> bool:
     all_ok = True
     for provider, model in MODELS:
+        effort = MODEL_ENV.get(model, {}).get("REASONING_EFFORT")
+        if provider == "fireworks-sampler":
+            cmd = [str(SAMPLER_PYTHON), str(SCRIPT_DIR / "muse_sampler.py"), "--model", model,
+                   "--reasoning", effort or "high", "Text to edit: Speaker 1: Hi Maria, did you see Josh today?"]
+            ok = subprocess.run(cmd).returncode == 0
+            all_ok = all_ok and ok
+            continue
         base_url, key_env = SMOKE_ENDPOINTS[provider]
         start = time.time()
         try:
             response = openai.OpenAI(api_key=os.getenv(key_env), base_url=base_url).chat.completions.create(
                 model=model,
+                extra_body={"reasoning_effort": effort} if effort else None,
                 messages=[
                     {"role": "system", "content": "Replace person names with [REDACTED]. Return only the edited text."},
                     {"role": "user", "content": "Text to edit: Speaker 1: Hi Maria, did you see Josh today?"},
@@ -140,10 +176,12 @@ def run_harness(skip_existing: bool) -> None:
             "OUTPUT_FOLDER": str(out_dir),
             "STATS_CSV": str(out_dir / "processing_statistics.csv"),
             "PYTHONUNBUFFERED": "1",
+            **MODEL_ENV.get(model, {}),
         }
         log = open(out_dir / "run.log", "w", encoding="utf-8")
         # cwd=SCRIPT_DIR: the harness reads original/ and Prompts.csv relative to cwd
-        proc = subprocess.Popen([sys.executable, str(HARNESS)], cwd=SCRIPT_DIR, env=env,
+        python = str(SAMPLER_PYTHON) if provider == "fireworks-sampler" else sys.executable
+        proc = subprocess.Popen([python, str(HARNESS)], cwd=SCRIPT_DIR, env=env,
                                 stdout=log, stderr=subprocess.STDOUT)
         procs.append((model, proc, log, time.time()))
         print(f"[start] {model} -> {out_dir / 'run.log'}")
@@ -228,6 +266,10 @@ def main():
     parser.add_argument("--skip-existing", action="store_true", help="don't re-run models whose outputs are complete")
     parser.add_argument("--score-only", action="store_true", help="skip redaction; score and plot existing outputs")
     args = parser.parse_args()
+
+    if not MUSE_ACCOUNT:
+        raise SystemExit("Set FIREWORKS_ACCOUNT_ID in deidentify/.env (see deidentify/.env.example); "
+                         "it names the fine-tuned Muse checkpoint and its results folder.")
 
     if args.smoke:
         raise SystemExit(0 if smoke_test() else 1)
